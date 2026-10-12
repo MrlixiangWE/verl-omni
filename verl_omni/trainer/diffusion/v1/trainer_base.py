@@ -541,9 +541,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         actor_loss_cfg = self.config.actor_rollout_ref.actor.diffusion_loss
         if rollout_cfg.rollout_adapter != "old":
             raise ValueError("Old-adapter algorithms require actor_rollout_ref.rollout.rollout_adapter=old.")
-        if actor_loss_cfg.loss_mode not in ("diffusion_nft", "dgpo"):
+        if not get_diffusion_loss_fn(actor_loss_cfg.loss_mode).uses_old_adapter:
             raise ValueError(
-                "Old-adapter algorithms require actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft or dgpo."
+                "Old-adapter algorithms require an actor_rollout_ref.actor.diffusion_loss.loss_mode that trains "
+                f"against the old adapter, got {actor_loss_cfg.loss_mode}."
             )
 
     def _prepare_actor_batch(self, batch: DataProto, reward_tensor: torch.Tensor) -> DataProto:
@@ -1365,11 +1366,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
         loss_mode = OmegaConf.select(self.config, "actor_rollout_ref.actor.diffusion_loss.loss_mode")
-        keep_groups = paired or loss_mode == "dgpo"
+        keep_groups = paired or (loss_mode is not None and get_diffusion_loss_fn(loss_mode).requires_whole_groups)
         if keep_groups and shuffle:
             logger.warning(
                 "Shuffle is not supported for direct preference during actor update."
-                "This is to prevent chosen/rejected pairs and DGPO rollout groups from being split across "
+                "This is to prevent chosen/rejected pairs and rollout groups from being split across "
                 "different micro batches."
                 "Setting shuffle to False."
             )

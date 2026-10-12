@@ -85,6 +85,9 @@ Training timesteps and noise are drawn once per training step and reused across
 
 ## Configuration
 
+DGPO trains LoRA adapters only: `actor_rollout_ref.model.lora_rank` must be > 0, and
+full-weight training is not supported.
+
 ```bash
 actor_rollout_ref.model.algorithm=dgpo
 actor_rollout_ref.model.model_type=diffusion_nft_model

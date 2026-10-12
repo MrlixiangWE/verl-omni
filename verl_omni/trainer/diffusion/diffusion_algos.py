@@ -59,6 +59,11 @@ class DiffusionLossFn(ABC):
     # trainer, e.g. ``old_log_probs``, ``advantages``). Same early-check
     # contract as ``required_model_output_keys`` for batch-side inputs.
     required_data_keys: tuple[str, ...] = ()
+    # Whether the loss trains against the LoRA ``old`` adapter that the rollout samples with.
+    uses_old_adapter: bool = False
+    # Whether the loss reduces over whole rollout groups inside a micro batch, so the
+    # trainer must not shuffle samples across micro batches.
+    requires_whole_groups: bool = False
 
     def validate_inputs(
         self,
@@ -795,6 +800,7 @@ class DPOLoss(DiffusionLossFn):
 class DiffusionNFTLoss(DiffusionLossFn):
     """DiffusionNFT forward-process direct-preference objective."""
 
+    uses_old_adapter = True
     required_model_output_keys = (
         "forward_prediction",
         "old_prediction",
@@ -1067,6 +1073,8 @@ class DGPOLoss(DiffusionLossFn):
     computed locally, so each micro batch must hold whole groups; the loss raises otherwise.
     """
 
+    uses_old_adapter = True
+    requires_whole_groups = True
     required_model_output_keys = (
         "forward_prediction",
         "old_prediction",
@@ -1180,7 +1188,8 @@ class DGPOLoss(DiffusionLossFn):
         Each rank receives a contiguous ``batch * n / dp`` slice of the update batch and of every mini batch and
         cuts it into contiguous micro batches, so groups stay whole only when every division is exact in units
         of ``n``. The loss also needs the LoRA ``old`` adapter for rollout and the reference forward, complete
-        groups from the v1 sampler, and the unstaged NFT engine path.
+        groups from the v1 sampler, the unstaged NFT engine path, and training timesteps that fit the rollout
+        schedule.
         """
         actor_cfg = config.actor_rollout_ref.actor
         model_cfg = config.actor_rollout_ref.model
@@ -1216,6 +1225,21 @@ class DGPOLoss(DiffusionLossFn):
             problems.append("actor_rollout_ref.actor.enable_timestep_staging must be False")
         if use_v1 and not OmegaConf.select(config, "trainer.v1.sampler.drop_incomplete_groups", default=False):
             problems.append("trainer.v1.sampler.drop_incomplete_groups must be True so groups arrive complete")
+        num_steps = OmegaConf.select(rollout_cfg, "pipeline.num_inference_steps", default=None)
+        timestep_range = OmegaConf.select(config, "algorithm.train_timestep_range", default=None)
+        count = OmegaConf.select(config, "algorithm.train_timestep_count", default=None)
+        if num_steps is not None:
+            num_steps = int(num_steps)
+            if timestep_range is None:
+                start, end = 0, num_steps
+            elif len(timestep_range) == 2:
+                start, end = int(timestep_range[0]), int(timestep_range[1])
+            else:
+                start, end = 0, 0
+            if not 0 <= start < end <= num_steps:
+                problems.append(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}")
+            elif count is not None and not 1 <= int(count) <= end - start:
+                problems.append(f"train_timestep_count={count} must be between 1 and {end - start}, the range width")
         if problems:
             raise ValueError("DGPO config is not supported: " + "; ".join(problems) + ".")
 
@@ -1240,14 +1264,14 @@ class DGPOLoss(DiffusionLossFn):
             raise ValueError(f"DGPO rollout timesteps must have shape [B, T], got {tuple(schedule.shape)}.")
         if not torch.equal(schedule, schedule[:1].expand_as(schedule)):
             raise ValueError("DGPO shares timesteps across the batch, so every rollout must use the same schedule.")
-        start, end = (
-            (0, schedule.shape[1]) if timestep_range is None else (int(timestep_range[0]), int(timestep_range[1]))
-        )
-        end = min(end, schedule.shape[1])
-        if not 0 <= start < end:
-            raise ValueError(f"train_timestep_range {timestep_range} is empty for a {schedule.shape[1]}-step schedule.")
+        num_steps = schedule.shape[1]
+        start, end = (0, num_steps) if timestep_range is None else (int(timestep_range[0]), int(timestep_range[1]))
+        if not 0 <= start < end <= num_steps:
+            raise ValueError(f"train_timestep_range {timestep_range} must satisfy 0 <= start < end <= {num_steps}.")
         width = end - start
-        count = max(1, int(width * timestep_fraction)) if count is None else min(int(count), width)
+        if count is not None and not 1 <= int(count) <= width:
+            raise ValueError(f"train_timestep_count={count} must be between 1 and {width}, the range width.")
+        count = max(1, int(width * timestep_fraction)) if count is None else int(count)
         index = torch.randperm(width, generator=generator)[:count] + start
         selected = schedule[:, index.to(schedule.device)].long()
         # The engine recovers the velocity target as (x_t - x_0) / t, so t must stay positive after flooring.

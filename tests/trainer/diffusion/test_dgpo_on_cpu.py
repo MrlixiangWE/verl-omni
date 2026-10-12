@@ -391,9 +391,15 @@ def test_dgpo_batch_through_the_nft_engine_step():
     assert "actor/group_weight_mean" in output["metrics"]
 
 
-@pytest.mark.parametrize("loss_mode,expected_shuffle", [("dgpo", False), ("diffusion_nft", True)])
+@pytest.mark.parametrize(
+    "loss_mode,whole_groups,expected_shuffle",
+    [("dgpo", None, False), ("diffusion_nft", None, True), ("diffusion_nft", True, False)],
+)
 @pytest.mark.parametrize("trainer_version", ["v0", "v1"])
-def test_actor_update_keeps_dgpo_groups_unshuffled(loss_mode, expected_shuffle, trainer_version):
+def test_actor_update_keeps_dgpo_groups_unshuffled(
+    loss_mode, whole_groups, expected_shuffle, trainer_version, monkeypatch
+):
+    """Shuffle follows the loss's ``requires_whole_groups`` attribute, not its name."""
     from unittest.mock import MagicMock
 
     from omegaconf import OmegaConf
@@ -401,6 +407,8 @@ def test_actor_update_keeps_dgpo_groups_unshuffled(loss_mode, expected_shuffle, 
     from verl_omni.trainer.diffusion.ray_diffusion_trainer import DirectPreferenceRayTrainer
     from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
 
+    if whole_groups is not None:
+        monkeypatch.setattr(type(get_diffusion_loss_fn(loss_mode)), "requires_whole_groups", whole_groups)
     config = OmegaConf.create(
         {
             "algorithm": {"paired_preference": False},
@@ -432,6 +440,37 @@ def test_actor_update_keeps_dgpo_groups_unshuffled(loss_mode, expected_shuffle, 
     assert tu.get_non_tensor_data(sent, "dataloader_kwargs", default=None) == {"shuffle": expected_shuffle}
 
 
+@pytest.mark.parametrize(
+    "loss_mode,uses_old_adapter,accepted",
+    [("dgpo", None, True), ("diffusion_nft", None, True), ("dpo", None, False), ("dpo", True, True)],
+)
+@pytest.mark.parametrize("trainer_version", ["v0", "v1"])
+def test_old_adapter_requires_a_loss_that_uses_it(loss_mode, uses_old_adapter, accepted, trainer_version, monkeypatch):
+    """The old-adapter check follows the loss's ``uses_old_adapter`` attribute, not its name."""
+    from omegaconf import OmegaConf
+
+    from verl_omni.trainer.diffusion.ray_diffusion_trainer import DirectPreferenceRayTrainer
+    from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"rollout_adapter": "old"},
+                "actor": {"diffusion_loss": {"loss_mode": loss_mode}},
+            }
+        }
+    )
+    if uses_old_adapter is not None:
+        monkeypatch.setattr(type(get_diffusion_loss_fn(loss_mode)), "uses_old_adapter", uses_old_adapter)
+    trainer_cls = DirectPreferenceRayTrainer if trainer_version == "v0" else PolicyGradientDiffusionTrainerV1
+    trainer = SimpleNamespace(config=config)
+    if accepted:
+        trainer_cls._validate_old_adapter_config(trainer)
+    else:
+        with pytest.raises(ValueError, match=f"trains against the old adapter, got {loss_mode}"):
+            trainer_cls._validate_old_adapter_config(trainer)
+
+
 def test_prepare_dgpo_actor_batch_keeps_contiguous_groups_in_place():
     """Already-contiguous rollouts are not permuted, so driver-side per-row extras stay aligned."""
     uid = ["b", "b", "a", "a"]
@@ -456,6 +495,16 @@ def test_dgpo_rejects_a_training_timestep_that_floors_to_zero():
     with pytest.raises(ValueError, match="must be >= 1"):
         DGPOLoss._select_shared_timesteps(schedule, [1, 2], 1, 1.0)
     assert DGPOLoss._select_shared_timesteps(schedule, [0, 1], 1, 1.0).tolist() == [[900], [900]]
+
+
+def test_dgpo_rejects_more_training_timesteps_than_the_range_holds():
+    schedule = torch.tensor([[900.0, 600.0, 300.0], [900.0, 600.0, 300.0]])
+    for count in (3, 0):
+        with pytest.raises(ValueError, match=f"train_timestep_count={count} must be between 1 and 2, the range width"):
+            DGPOLoss._select_shared_timesteps(schedule, [0, 2], count, 1.0)
+    with pytest.raises(ValueError, match="0 <= start < end <= 3"):
+        DGPOLoss._select_shared_timesteps(schedule, [0, 4], 2, 1.0)
+    assert DGPOLoss._select_shared_timesteps(schedule, [0, 2], 2, 1.0).shape == (2, 2)
 
 
 def make_trainer_config(**overrides):
@@ -505,6 +554,37 @@ def make_trainer_config(**overrides):
         ({"actor_rollout_ref.actor.use_kl_loss": True}, "use_kl_loss must be False"),
         ({"actor_rollout_ref.actor.enable_timestep_staging": True}, "enable_timestep_staging must be False"),
         ({"trainer.v1.sampler.drop_incomplete_groups": False}, "drop_incomplete_groups must be True"),
+        (
+            {
+                "actor_rollout_ref.rollout.pipeline.num_inference_steps": 10,
+                "algorithm.train_timestep_range": [0, 7],
+                "algorithm.train_timestep_count": 7,
+            },
+            None,
+        ),
+        (
+            {
+                "actor_rollout_ref.rollout.pipeline.num_inference_steps": 10,
+                "algorithm.train_timestep_range": [0, 7],
+                "algorithm.train_timestep_count": 8,
+            },
+            "train_timestep_count=8 must be between 1 and 7, the range width",
+        ),
+        (
+            {"actor_rollout_ref.rollout.pipeline.num_inference_steps": 10, "algorithm.train_timestep_count": 11},
+            "train_timestep_count=11 must be between 1 and 10, the range width",
+        ),
+        (
+            {"actor_rollout_ref.rollout.pipeline.num_inference_steps": 10, "algorithm.train_timestep_count": 0},
+            "train_timestep_count=0 must be between 1",
+        ),
+        *[
+            (
+                {"actor_rollout_ref.rollout.pipeline.num_inference_steps": 10, "algorithm.train_timestep_range": r},
+                "0 <= start < end <= 10",
+            )
+            for r in ([10, 12], [0, 11], [-2, 7], [0])
+        ],
     ],
 )
 def test_dgpo_trainer_config_requires_whole_groups(overrides, message):
